@@ -378,7 +378,8 @@ static void handleSettings() {
     html += g_mqttPass; html += "'></label>";
 
     html += "<button type='submit'>Save &amp; Restart</button></form>"
-            "<p class='foot'>The device will restart after saving. Reconnect in a few seconds.</p>"
+            "<p class='foot'>The device will restart after saving. Reconnect in a few seconds."
+            "<br>Firmware build: " __DATE__ " " __TIME__ "</p>"
             "</body></html>";
     webServer.send(200, "text/html", html);
 }
