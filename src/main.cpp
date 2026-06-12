@@ -84,6 +84,10 @@ void updateDisplay() {
 #include <WebServer.h>
 #include <Preferences.h>
 
+#define AVAIL_TOPIC          "homeassistant/sensor/tank_monitor/availability"
+#define LASTSEEN_DISC_TOPIC  "homeassistant/sensor/hw_last_seen/config"
+#define LASTSEEN_STATE_TOPIC "homeassistant/sensor/hw_last_seen/state"
+
 // Runtime MQTT settings — loaded from NVS on boot, fallback to config.h defaults
 static char g_mqttHost[64];
 static int  g_mqttPort;
@@ -93,6 +97,7 @@ static char g_mqttPass[64];
 static Preferences   prefs;
 static WebServer     webServer(80);
 static unsigned long lastMqttRetry = 0;
+static bool          otaReady      = false;
 
 // LCD display rotation: alternates between temps and IP every DISPLAY_TOGGLE_MS
 static unsigned long lastDisplayToggle = 0;
@@ -101,6 +106,9 @@ static const unsigned long DISPLAY_TOGGLE_MS = 5000UL;
 
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
+
+static void setupOTA();
+static void setupWebServer();
 
 static void loadSettings() {
     prefs.begin("tank", true);
@@ -128,6 +136,7 @@ static bool publishDiscovery(const SensorDef& s) {
     doc["name"]                = s.label;
     doc["unique_id"]           = s.uniqueId;
     doc["state_topic"]         = s.stateTopic;
+    doc["availability_topic"]  = AVAIL_TOPIC;
     doc["unit_of_measurement"] = "°C";
     doc["device_class"]        = "temperature";
     doc["state_class"]         = "measurement";
@@ -140,43 +149,93 @@ static bool publishDiscovery(const SensorDef& s) {
     return mqtt.publish(s.discoveryTopic, payload, /*retain=*/true);
 }
 
+static bool publishLastSeenDiscovery() {
+    JsonDocument doc;
+    doc["name"]               = "Last Seen";
+    doc["unique_id"]          = "hw_last_seen";
+    doc["state_topic"]        = LASTSEEN_STATE_TOPIC;
+    doc["availability_topic"] = AVAIL_TOPIC;
+    doc["device_class"]       = "timestamp";
+    doc["entity_category"]    = "diagnostic";
+    JsonObject device = doc["device"].to<JsonObject>();
+    device["identifiers"][0] = "hot_water_tanks";
+    device["name"]           = "Hot Water Tanks";
+    device["model"]          = "ESP32 + DS18B20";
+    char payload[512];
+    serializeJson(doc, payload);
+    return mqtt.publish(LASTSEEN_DISC_TOPIC, payload, /*retain=*/true);
+}
+
+static void publishLastSeen() {
+    struct tm t;
+    if (!getLocalTime(&t, 0)) return;  // NTP not yet synced
+    char ts[26];
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &t);
+    mqtt.publish(LASTSEEN_STATE_TOPIC, ts);
+}
+
 // Non-blocking MQTT connect — tries at most once every 5 s so the web server stays responsive
 static bool tryConnectMqtt() {
     if (mqtt.connected()) return true;
+    if (WiFi.status() != WL_CONNECTED) return false;
     unsigned long now = millis();
     if (lastMqttRetry > 0 && now - lastMqttRetry < 5000UL) return false;
     lastMqttRetry = now;
     Serial.print("Connecting to MQTT broker...");
-    if (mqtt.connect("tank-monitor", g_mqttUser, g_mqttPass)) {
+    // LWT: broker publishes "offline" (retained) if we disconnect unexpectedly
+    if (mqtt.connect("tank-monitor", g_mqttUser, g_mqttPass,
+                     AVAIL_TOPIC, /*qos*/1, /*retain*/true, "offline")) {
         Serial.println("connected");
+        mqtt.publish(AVAIL_TOPIC, "online", /*retain=*/true);
         mqtt.publish("homeassistant/sensor/tank_monitor/temperature/config", "", true);
         for (int i = 0; i < NUM_SENSORS; i++) {
             bool ok = publishDiscovery(SENSORS[i]);
             Serial.printf("Discovery %s: %s\n", SENSORS[i].label, ok ? "published" : "FAILED");
         }
+        publishLastSeenDiscovery();
         return true;
     }
     Serial.printf("failed (rc=%d), retry in 5s\n", mqtt.state());
     return false;
 }
 
-void connectWifi() {
-    if (lcdPresent) {
-        lcd.clear();
-        lcd.print("Connecting WiFi");
+// Non-blocking WiFi maintenance — called every loop(). On first successful connect (and on
+// reconnect after drop) lazily initialises OTA, web server, and NTP. Retries every 30 s.
+static void maintainWifi() {
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!otaReady) {
+            otaReady = true;
+            configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+            setupOTA();
+            setupWebServer();
+            String ip = WiFi.localIP().toString();
+            Serial.printf("WiFi connected. IP: %s\n", ip.c_str());
+            Serial.printf("Web: http://%s/  OTA: pio run -t upload --upload-port=%s\n",
+                          ip.c_str(), ip.c_str());
+            if (lcdPresent) {
+                lcd.clear();
+                lcd.setCursor(0, 0); lcd.print("WiFi connected");
+                lcd.setCursor(0, 1); lcd.print(ip.substring(0, 16));
+            }
+            lastDisplayToggle = millis();
+        }
+        return;
     }
-    Serial.printf("\nConnecting to %s", WIFI_SSID);
+
+    if (otaReady) {
+        Serial.println("WiFi lost — will retry every 30 s");
+        otaReady = false;
+    }
+
+    static unsigned long lastAttempt = 0;
+    unsigned long now = millis();
+    if (lastAttempt > 0 && now - lastAttempt < 30000UL) return;
+    lastAttempt = now;
+
+    Serial.printf("WiFi connecting to %s...\n", WIFI_SSID);
+    WiFi.disconnect(true);
+    delay(100);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    String ip = WiFi.localIP().toString();
-    Serial.printf("\nWiFi connected. IP: %s\n", ip.c_str());
-    if (lcdPresent) {
-        lcd.setCursor(0, 1);
-        lcd.print(ip.substring(0, 16));
-    }
 }
 
 static void setupOTA() {
@@ -208,7 +267,7 @@ static void setupOTA() {
 // ── LCD rotation ──────────────────────────────────────────────────────────────
 
 static void showIpScreen() {
-    if (!lcdPresent) return;
+    if (!lcdPresent || WiFi.status() != WL_CONNECTED) return;
     String ip = WiFi.localIP().toString();
     char line2[17];
     snprintf(line2, sizeof(line2), "%-16s", ip.c_str());
@@ -389,17 +448,10 @@ void setup() {
     delay(1000);
 
 #if ENABLE_WIFI
-    connectWifi();
     loadSettings();
     mqtt.setServer(g_mqttHost, g_mqttPort);
     mqtt.setBufferSize(1024);
-    tryConnectMqtt();
-    setupOTA();
-    setupWebServer();
-    Serial.printf("Web interface: http://%s/\n", WiFi.localIP().toString().c_str());
-    Serial.printf("OTA upload:    pio run -t upload --upload-port=%s\n",
-                  WiFi.localIP().toString().c_str());
-    lastDisplayToggle = millis();  // start 5-s rotation clock after setup completes
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);  // first attempt; maintainWifi() retries in loop()
 #endif
 
     updateDisplay();
@@ -407,10 +459,13 @@ void setup() {
 
 void loop() {
 #if ENABLE_WIFI
-    tryConnectMqtt();
-    mqtt.loop();
-    ArduinoOTA.handle();
-    webServer.handleClient();
+    maintainWifi();
+    if (WiFi.status() == WL_CONNECTED) {
+        tryConnectMqtt();
+        mqtt.loop();
+        if (otaReady) ArduinoOTA.handle();
+        webServer.handleClient();
+    }
     tickDisplay();
 #endif
 
@@ -437,6 +492,9 @@ void loop() {
 #endif
             }
         }
+#if ENABLE_WIFI
+        if (mqtt.connected()) publishLastSeen();
+#endif
         lastReadAt = millis();
         // Only redraw temps if the LCD is currently showing the temp screen
 #if ENABLE_WIFI
