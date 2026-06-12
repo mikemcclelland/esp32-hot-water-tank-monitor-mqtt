@@ -96,8 +96,11 @@ static char g_mqttPass[64];
 
 static Preferences   prefs;
 static WebServer     webServer(80);
-static unsigned long lastMqttRetry = 0;
-static bool          otaReady      = false;
+static unsigned long lastMqttRetry    = 0;
+static bool          otaReady         = false;
+static unsigned long mqttPublishCount = 0;
+static char          mqttConnectedTime[20] = "--";
+static char          mqttLastPubTime[20]   = "--";
 
 // LCD display rotation: alternates between temps and IP every DISPLAY_TOGGLE_MS
 static unsigned long lastDisplayToggle = 0;
@@ -109,6 +112,18 @@ PubSubClient mqtt(wifiClient);
 
 static void setupOTA();
 static void setupWebServer();
+
+static void nowToStr(char* buf, size_t len) {
+    struct tm t;
+    if (getLocalTime(&t, 0)) strftime(buf, len, "%d %b %H:%M:%S", &t);
+    else                     strncpy(buf, "--", len);
+}
+
+static bool mqttPublish(const char* topic, const char* payload, bool retain = false) {
+    bool ok = mqtt.publish(topic, payload, retain);
+    if (ok) { mqttPublishCount++; nowToStr(mqttLastPubTime, sizeof(mqttLastPubTime)); }
+    return ok;
+}
 
 static void loadSettings() {
     prefs.begin("tank", true);
@@ -171,7 +186,7 @@ static void publishLastSeen() {
     if (!getLocalTime(&t, 0)) return;  // NTP not yet synced
     char ts[26];
     strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &t);
-    mqtt.publish(LASTSEEN_STATE_TOPIC, ts);
+    mqttPublish(LASTSEEN_STATE_TOPIC, ts);
 }
 
 // Non-blocking MQTT connect — tries at most once every 5 s so the web server stays responsive
@@ -187,6 +202,7 @@ static bool tryConnectMqtt() {
                      AVAIL_TOPIC, /*qos*/1, /*retain*/true, "offline")) {
         Serial.println("connected");
         mqtt.publish(AVAIL_TOPIC, "online", /*retain=*/true);
+        nowToStr(mqttConnectedTime, sizeof(mqttConnectedTime));
         mqtt.publish("homeassistant/sensor/tank_monitor/temperature/config", "", true);
         for (int i = 0; i < NUM_SENSORS; i++) {
             bool ok = publishDiscovery(SENSORS[i]);
@@ -289,99 +305,196 @@ static void tickDisplay() {
 // ── Web UI ────────────────────────────────────────────────────────────────────
 
 static const char PAGE_CSS[] =
-    "body{font-family:sans-serif;max-width:520px;margin:30px auto;padding:0 16px;color:#333}"
-    "nav{display:flex;gap:12px;margin-bottom:24px}"
-    "nav a{text-decoration:none;color:#0066cc;padding:6px 14px;border-radius:4px}"
-    "nav a.on{background:#0066cc;color:#fff}"
-    "h1{margin:0 0 20px;font-size:1.4em}"
-    "table{width:100%;border-collapse:collapse}"
-    "th,td{padding:10px 12px;border:1px solid #ddd;text-align:left}"
-    "th{background:#f8f8f8;font-weight:600}"
-    ".ok{color:#2a9d2a}.na{color:#aaa}.err{color:#c00}"
-    "label{display:block;margin-bottom:14px}"
-    "label span{display:block;font-size:.85em;font-weight:600;color:#555;margin-bottom:4px}"
-    "input{width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;"
-           "border-radius:4px;font-size:1em}"
-    "button{margin-top:8px;padding:10px 24px;background:#0066cc;color:#fff;"
-            "border:none;border-radius:4px;font-size:1em;cursor:pointer}"
-    "button:hover{background:#004fa3}"
-    ".foot{font-size:.8em;color:#999;margin-top:20px}";
+    "*{box-sizing:border-box}"
+    "body{margin:0;padding:0;background:#f0f0f0;font-family:sans-serif;font-size:14px;color:#222}"
+    ".wrap{max-width:920px;margin:0 auto;padding:20px 24px}"
+    "h1{margin:0 0 12px;font-size:1.8em;font-weight:700}"
+    "h2{margin:20px 0 8px;font-size:1.1em;font-weight:700}"
+    ".topbar{display:flex;align-items:center;gap:20px;border-bottom:1px solid #ccc;"
+             "padding-bottom:10px;margin-bottom:20px}"
+    ".topbar a{text-decoration:none;color:#0066cc;font-size:.95em}"
+    ".topbar a.on{font-weight:700}"
+    ".topbar form{margin:0 0 0 auto}"
+    ".btn-reboot{background:#cc0000;color:#fff;border:none;border-radius:4px;"
+                "padding:5px 14px;cursor:pointer;font-size:.9em}"
+    ".clock{position:fixed;top:16px;right:20px;background:#fff;border:1px solid #ccc;"
+            "border-radius:4px;padding:6px 14px;text-align:right;font-size:.8em;"
+            "line-height:1.7;color:#444}"
+    ".section{border:1px solid #ccc;border-radius:4px;margin-bottom:16px;"
+              "overflow:hidden;background:#fff}"
+    ".shdr{background:#333;color:#fff;font-weight:700;padding:8px 14px;font-size:.9em}"
+    ".section table{width:100%;border-collapse:collapse}"
+    ".section td{padding:9px 14px;border-bottom:1px solid #ebebeb;vertical-align:middle}"
+    ".section tr:last-child td{border-bottom:none}"
+    ".section td:first-child{width:38%;color:#555}"
+    ".ok{color:#2a9d2a}.na{color:#aaa}.err{color:#cc0000}"
+    ".connected{color:#2a9d2a;font-weight:600}"
+    ".disconnected{color:#cc0000;font-weight:600}"
+    "input[type=text],input[type=number],input[type=password]{"
+        "width:100%;padding:6px 8px;border:1px solid #ccc;border-radius:3px;font-size:1em}"
+    ".hint{font-size:.8em;color:#aaa;margin-top:3px}"
+    ".actions{display:flex;gap:10px;margin:10px 0 4px}"
+    ".btn{background:#333;color:#fff;border:none;border-radius:4px;"
+         "padding:8px 16px;cursor:pointer;font-size:.9em}"
+    ".btn:hover{background:#555}"
+    ".foot{font-size:.8em;color:#aaa;margin-top:6px}";
 
-static String pageHead(const char* title, bool autoRefresh = false) {
+static String pageHead(bool autoRefresh = false) {
     String h = "<!DOCTYPE html><html><head>"
                "<meta charset='utf-8'>"
                "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-               "<title>"; h += title; h += "</title>";
+               "<title>Tank Monitor</title>";
     if (autoRefresh) h += "<meta http-equiv='refresh' content='30'>";
-    h += "<style>"; h += PAGE_CSS; h += "</style></head><body>";
+    h += "<style>"; h += PAGE_CSS; h += "</style></head><body><div class='wrap'>";
+    // Fixed clock widget
+    h += "<div class='clock'>Local time: ";
+    struct tm t;
+    if (getLocalTime(&t, 0)) {
+        char buf[20]; strftime(buf, sizeof(buf), "%H:%M:%S %d-%m-%y", &t); h += buf;
+    } else { h += "--"; }
+    h += "<br>Up: ";
+    unsigned long s = millis() / 1000;
+    int dd = s / 86400; s %= 86400;
+    int hh = s / 3600;  s %= 3600;
+    int mm = s / 60;    s %= 60;
+    char up[20]; snprintf(up, sizeof(up), "%dd %02d:%02d:%02d", dd, hh, (int)mm, (int)s);
+    h += up; h += "</div>";
     return h;
 }
 
-static String navBar(bool onStatus) {
-    if (onStatus)
-        return "<nav><a href='/' class='on'>Status</a><a href='/settings'>Settings</a></nav>";
-    return "<nav><a href='/'>Status</a><a href='/settings' class='on'>Settings</a></nav>";
+static String navBar(const char* active) {
+    String n = "<h1>Tank Monitor (ESP32)</h1><div class='topbar'>";
+    n += strcmp(active, "dash") == 0
+         ? "<a href='/' class='on'>Dashboard</a>" : "<a href='/'>Dashboard</a>";
+    n += strcmp(active, "mqtt") == 0
+         ? "<a href='/mqtt' class='on'>MQTT</a>" : "<a href='/mqtt'>MQTT</a>";
+    n += "<form method='POST' action='/reboot'>"
+         "<button class='btn-reboot' type='submit'>Reboot</button></form>"
+         "</div>";
+    return n;
 }
 
-static void handleStatus() {
-    String html = pageHead("Tank Monitor", /*autoRefresh=*/true);
-    html += navBar(true);
-    html += "<h1>Tank Monitor</h1>"
-            "<table><tr><th>Sensor</th><th>&deg;C</th><th>&deg;F</th></tr>";
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+
+static void handleDashboard() {
+    String html = pageHead(/*autoRefresh=*/true);
+    html += navBar("dash");
+    html += "<div class='section'><div class='shdr'>Sensors</div><table>";
     for (int i = 0; i < NUM_SENSORS; i++) {
         html += "<tr><td>"; html += SENSORS[i].label; html += "</td>";
         if (temps[i] == DEVICE_DISCONNECTED_C) {
             html += "<td class='na'>--</td><td class='na'>--</td>";
         } else {
             char buf[64];
-            snprintf(buf, sizeof(buf), "<td class='ok'>%.1f</td><td>%.1f</td>",
+            snprintf(buf, sizeof(buf), "<td class='ok'>%.1f&deg;C</td><td>%.1f&deg;F</td>",
                      temps[i], temps[i] * 9.0f / 5.0f + 32.0f);
             html += buf;
         }
         html += "</tr>";
     }
-    html += "</table><p class='foot'>";
-    if (mqtt.connected()) {
-        html += "<span class='ok'>&#10003; MQTT connected</span>";
-    } else {
-        html += "<span class='err'>&#10007; MQTT disconnected &mdash; "
-                "<a href='/settings'>check settings</a></span>";
-    }
-    html += " &middot; broker: "; html += g_mqttHost;
-    html += ":"; html += g_mqttPort;
-    html += " &middot; auto-refreshes every 30&nbsp;s</p>"
-            "</body></html>";
+    html += "</table></div>";
+    html += "<p class='foot'>";
+    if (mqtt.connected()) html += "<span class='ok'>&#x25cf;&nbsp;MQTT connected</span>";
+    else                  html += "<span class='err'>&#x25cf;&nbsp;MQTT disconnected &mdash; "
+                                  "<a href='/mqtt'>check settings</a></span>";
+    html += " &middot; auto-refreshes every 30&nbsp;s</p>";
+    html += "</div></body></html>";
     webServer.send(200, "text/html", html);
 }
 
-static void handleSettings() {
-    char portBuf[8];
-    itoa(g_mqttPort, portBuf, 10);
+// ── MQTT status + settings ────────────────────────────────────────────────────
 
-    String html = pageHead("Tank Monitor - Settings");
-    html += navBar(false);
-    html += "<h1>Settings</h1>"
-            "<form method='POST' action='/save'>";
+static void handleMqttPage() {
+    String html = pageHead();
+    html += navBar("mqtt");
 
-    html += "<label><span>MQTT Host</span>"
-            "<input name='host' value='"; html += g_mqttHost; html += "' required></label>";
+    // Status card
+    html += "<h2>MQTT</h2>"
+            "<div class='section'><div class='shdr'>Status</div><table>";
+    html += "<tr><td>Broker</td><td>"; html += g_mqttHost; html += ":";
+            html += g_mqttPort; html += "</td></tr>";
+    html += "<tr><td>Connection</td><td>";
+    if (mqtt.connected()) html += "<span class='connected'>&#x25cf;&nbsp;Connected</span>";
+    else                  html += "<span class='disconnected'>&#x25cf;&nbsp;Disconnected</span>";
+    html += "</td></tr>";
+    html += "<tr><td>Last connected</td><td>"; html += mqttConnectedTime; html += "</td></tr>";
+    html += "<tr><td>Messages published</td><td>"; html += String(mqttPublishCount); html += "</td></tr>";
+    html += "<tr><td>Last published</td><td>"; html += mqttLastPubTime; html += "</td></tr>";
+    html += "</table></div>";
 
-    html += "<label><span>MQTT Port</span>"
-            "<input name='port' type='number' value='"; html += portBuf;
-    html += "' min='1' max='65535' required></label>";
+    // Action buttons
+    html += "<div class='actions'>"
+            "<form method='POST' action='/mqtt/reconnect' style='margin:0'>"
+            "<button class='btn' type='submit'>Force reconnect</button></form>"
+            "<form method='POST' action='/mqtt/discover' style='margin:0'>"
+            "<button class='btn' type='submit'>Republish discovery</button></form>"
+            "<form method='POST' action='/mqtt/publish' style='margin:0'>"
+            "<button class='btn' type='submit'>Send last reading</button></form>"
+            "</div>"
+            "<p class='foot'>Republish discovery re-sends the HA auto-discovery config messages. "
+            "Send last reading republishes the most recent sensor values.</p>";
 
-    html += "<label><span>MQTT Username</span>"
-            "<input name='user' autocomplete='off' value='"; html += g_mqttUser; html += "'></label>";
+    // Settings card
+    html += "<h2>MQTT Settings</h2>"
+            "<form method='POST' action='/save'>"
+            "<div class='section'>"
+            "<div class='shdr'>Broker</div><table>"
+            "<tr><td>Host / IP</td><td>"
+            "<input type='text' name='host' value='"; html += g_mqttHost;
+    html += "' required></td></tr>"
+            "<tr><td>Port</td><td>"
+            "<input type='number' name='port' value='"; html += g_mqttPort;
+    html += "' min='1' max='65535' required></td></tr>"
+            "</table>"
+            "<div class='shdr'>Credentials</div><table>"
+            "<tr><td>Username</td><td>"
+            "<input type='text' name='user' autocomplete='off' value='"; html += g_mqttUser;
+    html += "'></td></tr>"
+            "<tr><td>Password</td><td>"
+            "<input type='password' name='pass' autocomplete='new-password' placeholder='(unchanged)'>"
+            "<div class='hint'>Leave blank to keep current password.</div>"
+            "</td></tr>"
+            "</table></div>"
+            "<div class='actions'>"
+            "<button class='btn' type='submit'>Save &amp; reconnect</button></div>"
+            "<p class='foot'>Firmware build: " __DATE__ " " __TIME__ "</p>"
+            "</form>";
 
-    html += "<label><span>MQTT Password</span>"
-            "<input name='pass' type='password' autocomplete='new-password' value='";
-    html += g_mqttPass; html += "'></label>";
-
-    html += "<button type='submit'>Save &amp; Restart</button></form>"
-            "<p class='foot'>The device will restart after saving. Reconnect in a few seconds."
-            "<br>Firmware build: " __DATE__ " " __TIME__ "</p>"
-            "</body></html>";
+    html += "</div></body></html>";
     webServer.send(200, "text/html", html);
+}
+
+static void handleMqttReconnect() {
+    mqtt.disconnect();
+    lastMqttRetry = 0;
+    webServer.sendHeader("Location", "/mqtt");
+    webServer.send(303, "text/plain", "");
+}
+
+static void handleMqttDiscover() {
+    if (mqtt.connected()) {
+        for (int i = 0; i < NUM_SENSORS; i++) publishDiscovery(SENSORS[i]);
+        publishLastSeenDiscovery();
+    }
+    webServer.sendHeader("Location", "/mqtt");
+    webServer.send(303, "text/plain", "");
+}
+
+static void handleMqttPublish() {
+    if (mqtt.connected()) {
+        for (int i = 0; i < NUM_SENSORS; i++) {
+            if (temps[i] != DEVICE_DISCONNECTED_C) {
+                char payload[16];
+                snprintf(payload, sizeof(payload), "%.1f", temps[i]);
+                mqttPublish(SENSORS[i].stateTopic, payload);
+            } else {
+                mqttPublish(SENSORS[i].stateTopic, "unavailable");
+            }
+        }
+        publishLastSeen();
+    }
+    webServer.sendHeader("Location", "/mqtt");
+    webServer.send(303, "text/plain", "");
 }
 
 static void handleSave() {
@@ -394,23 +507,41 @@ static void handleSave() {
         webServer.send(400, "text/plain", "Bad request: host and valid port are required");
         return;
     }
+    if (pass.isEmpty()) pass = String(g_mqttPass);  // keep existing password if blank
 
     persistSettings(host, port, user, pass);
 
-    String html = pageHead("Tank Monitor - Saved");
-    html += "<h1>Settings saved</h1>"
-            "<p>The device is restarting&hellip;</p>"
-            "<p class='foot'>Reload this page in a few seconds.</p>"
-            "</body></html>";
+    String html = pageHead() + navBar("mqtt");
+    html += "<p>Settings saved. Rebooting&hellip;</p>"
+            "<p class='foot'>Reconnect in a few seconds, then <a href='/mqtt'>reload</a>.</p>"
+            "</div></body></html>";
     webServer.send(200, "text/html", html);
     delay(1000);
     ESP.restart();
 }
 
+static void handleReboot() {
+    String html = pageHead() + navBar("dash");
+    html += "<p>Rebooting&hellip;</p>"
+            "<p class='foot'>Reconnect in a few seconds, then <a href='/'>reload</a>.</p>"
+            "</div></body></html>";
+    webServer.send(200, "text/html", html);
+    delay(500);
+    ESP.restart();
+}
+
 static void setupWebServer() {
-    webServer.on("/",         HTTP_GET,  handleStatus);
-    webServer.on("/settings", HTTP_GET,  handleSettings);
-    webServer.on("/save",     HTTP_POST, handleSave);
+    webServer.on("/",               HTTP_GET,  handleDashboard);
+    webServer.on("/mqtt",           HTTP_GET,  handleMqttPage);
+    webServer.on("/mqtt/reconnect", HTTP_POST, handleMqttReconnect);
+    webServer.on("/mqtt/discover",  HTTP_POST, handleMqttDiscover);
+    webServer.on("/mqtt/publish",   HTTP_POST, handleMqttPublish);
+    webServer.on("/save",           HTTP_POST, handleSave);
+    webServer.on("/reboot",         HTTP_POST, handleReboot);
+    webServer.on("/settings",       HTTP_GET,  []() {   // backward-compat redirect
+        webServer.sendHeader("Location", "/mqtt");
+        webServer.send(301, "text/plain", "");
+    });
     webServer.begin();
 }
 
@@ -479,7 +610,7 @@ void loop() {
             if (temps[i] == DEVICE_DISCONNECTED_C) {
                 Serial.printf("%-16s: not connected\n", SENSORS[i].label);
 #if ENABLE_WIFI
-                if (mqtt.connected()) mqtt.publish(SENSORS[i].stateTopic, "unavailable");
+                if (mqtt.connected()) mqttPublish(SENSORS[i].stateTopic, "unavailable");
 #endif
             } else {
                 Serial.printf("%-16s: %.1f°C  (%.1f°F)\n",
@@ -488,7 +619,7 @@ void loop() {
                 if (mqtt.connected()) {
                     char payload[16];
                     snprintf(payload, sizeof(payload), "%.1f", temps[i]);
-                    mqtt.publish(SENSORS[i].stateTopic, payload);
+                    mqttPublish(SENSORS[i].stateTopic, payload);
                 }
 #endif
             }
