@@ -1,0 +1,448 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <LiquidCrystal_I2C.h>
+#include "config.h"
+
+struct SensorDef {
+    uint8_t     pin;
+    const char* label;
+    const char* uniqueId;
+    const char* discoveryTopic;
+    const char* stateTopic;
+};
+
+static const SensorDef SENSORS[] = {
+    { PIN_RHS_TOP,
+      "RHS Tank Top",    "hw_rhs_top",
+      "homeassistant/sensor/hw_rhs_top/temperature/config",
+      "homeassistant/sensor/hw_rhs_top/temperature/state" },
+    { PIN_RHS_BOTTOM,
+      "RHS Tank Bottom", "hw_rhs_bottom",
+      "homeassistant/sensor/hw_rhs_bottom/temperature/config",
+      "homeassistant/sensor/hw_rhs_bottom/temperature/state" },
+    { PIN_LHS_TOP,
+      "LHS Tank Top",    "hw_lhs_top",
+      "homeassistant/sensor/hw_lhs_top/temperature/config",
+      "homeassistant/sensor/hw_lhs_top/temperature/state" },
+    { PIN_LHS_BOTTOM,
+      "LHS Tank Bottom", "hw_lhs_bottom",
+      "homeassistant/sensor/hw_lhs_bottom/temperature/config",
+      "homeassistant/sensor/hw_lhs_bottom/temperature/state" },
+};
+static const int NUM_SENSORS = 4;
+
+OneWire ow0(PIN_RHS_TOP), ow1(PIN_RHS_BOTTOM), ow2(PIN_LHS_TOP), ow3(PIN_LHS_BOTTOM);
+DallasTemperature ds[NUM_SENSORS];
+
+float temps[NUM_SENSORS];
+
+// ── Display ───────────────────────────────────────────────────────────────────
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+bool lcdPresent = false;
+
+static bool lcdProbe() {
+    Wire.begin();
+    Wire.beginTransmission(0x27);
+    return Wire.endTransmission() == 0;
+}
+
+static void formatTempInt(char* buf, float t) {
+    if (t == DEVICE_DISCONNECTED_C) {
+        strcpy(buf, "---  ");
+    } else {
+        int deg = (int)roundf(t);
+        if (deg <   0) deg = 0;
+        if (deg > 999) deg = 999;
+        snprintf(buf, 6, "%03dC ", deg);
+    }
+}
+
+void updateDisplay() {
+    if (!lcdPresent) return;
+    char lt[6], rt[6], lb[6], rb[6];
+    formatTempInt(lt, temps[2]);
+    formatTempInt(rt, temps[0]);
+    formatTempInt(lb, temps[3]);
+    formatTempInt(rb, temps[1]);
+    char line1[17], line2[17];
+    snprintf(line1, sizeof(line1), "LT:%sRT:%s", lt, rt);
+    snprintf(line2, sizeof(line2), "LB:%sRB:%s", lb, rb);
+    lcd.setCursor(0, 0); lcd.print(line1);
+    lcd.setCursor(0, 1); lcd.print(line2);
+}
+
+// ── WiFi / MQTT / OTA / Web ───────────────────────────────────────────────────
+
+#if ENABLE_WIFI
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <ArduinoOTA.h>
+#include <WebServer.h>
+#include <Preferences.h>
+
+// Runtime MQTT settings — loaded from NVS on boot, fallback to config.h defaults
+static char g_mqttHost[64];
+static int  g_mqttPort;
+static char g_mqttUser[32];
+static char g_mqttPass[64];
+
+static Preferences   prefs;
+static WebServer     webServer(80);
+static unsigned long lastMqttRetry = 0;
+
+// LCD display rotation: alternates between temps and IP every DISPLAY_TOGGLE_MS
+static unsigned long lastDisplayToggle = 0;
+static bool          showingIp         = false;
+static const unsigned long DISPLAY_TOGGLE_MS = 5000UL;
+
+WiFiClient   wifiClient;
+PubSubClient mqtt(wifiClient);
+
+static void loadSettings() {
+    prefs.begin("tank", true);
+    String h = prefs.getString("mqtt_host", MQTT_HOST);
+    h.toCharArray(g_mqttHost, sizeof(g_mqttHost));
+    g_mqttPort = prefs.getInt("mqtt_port", MQTT_PORT);
+    String u = prefs.getString("mqtt_user", MQTT_USER);
+    u.toCharArray(g_mqttUser, sizeof(g_mqttUser));
+    String p = prefs.getString("mqtt_pass", MQTT_PASS);
+    p.toCharArray(g_mqttPass, sizeof(g_mqttPass));
+    prefs.end();
+}
+
+static void persistSettings(const String& host, int port, const String& user, const String& pass) {
+    prefs.begin("tank", false);
+    prefs.putString("mqtt_host", host);
+    prefs.putInt("mqtt_port", port);
+    prefs.putString("mqtt_user", user);
+    prefs.putString("mqtt_pass", pass);
+    prefs.end();
+}
+
+static bool publishDiscovery(const SensorDef& s) {
+    JsonDocument doc;
+    doc["name"]                = s.label;
+    doc["unique_id"]           = s.uniqueId;
+    doc["state_topic"]         = s.stateTopic;
+    doc["unit_of_measurement"] = "°C";
+    doc["device_class"]        = "temperature";
+    doc["state_class"]         = "measurement";
+    JsonObject device = doc["device"].to<JsonObject>();
+    device["identifiers"][0] = "hot_water_tanks";
+    device["name"]           = "Hot Water Tanks";
+    device["model"]          = "ESP32 + DS18B20";
+    char payload[512];
+    serializeJson(doc, payload);
+    return mqtt.publish(s.discoveryTopic, payload, /*retain=*/true);
+}
+
+// Non-blocking MQTT connect — tries at most once every 5 s so the web server stays responsive
+static bool tryConnectMqtt() {
+    if (mqtt.connected()) return true;
+    unsigned long now = millis();
+    if (lastMqttRetry > 0 && now - lastMqttRetry < 5000UL) return false;
+    lastMqttRetry = now;
+    Serial.print("Connecting to MQTT broker...");
+    if (mqtt.connect("tank-monitor", g_mqttUser, g_mqttPass)) {
+        Serial.println("connected");
+        mqtt.publish("homeassistant/sensor/tank_monitor/temperature/config", "", true);
+        for (int i = 0; i < NUM_SENSORS; i++) {
+            bool ok = publishDiscovery(SENSORS[i]);
+            Serial.printf("Discovery %s: %s\n", SENSORS[i].label, ok ? "published" : "FAILED");
+        }
+        return true;
+    }
+    Serial.printf("failed (rc=%d), retry in 5s\n", mqtt.state());
+    return false;
+}
+
+void connectWifi() {
+    if (lcdPresent) {
+        lcd.clear();
+        lcd.print("Connecting WiFi");
+    }
+    Serial.printf("\nConnecting to %s", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    String ip = WiFi.localIP().toString();
+    Serial.printf("\nWiFi connected. IP: %s\n", ip.c_str());
+    if (lcdPresent) {
+        lcd.setCursor(0, 1);
+        lcd.print(ip.substring(0, 16));
+    }
+}
+
+static void setupOTA() {
+    ArduinoOTA.setHostname("tank-monitor");
+    ArduinoOTA.onStart([]() {
+        Serial.println("OTA update starting...");
+        if (lcdPresent) {
+            lcd.clear();
+            lcd.print("OTA Updating...");
+        }
+    });
+    ArduinoOTA.onEnd([]() {
+        Serial.println("OTA update complete");
+        if (lcdPresent) {
+            lcd.clear();
+            lcd.print("OTA Done!");
+        }
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        Serial.printf("OTA progress: %u%%\n", progress * 100 / total);
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        Serial.printf("OTA error [%u]\n", error);
+    });
+    ArduinoOTA.begin();
+    Serial.println("OTA ready (hostname: tank-monitor)");
+}
+
+// ── LCD rotation ──────────────────────────────────────────────────────────────
+
+static void showIpScreen() {
+    if (!lcdPresent) return;
+    String ip = WiFi.localIP().toString();
+    char line2[17];
+    snprintf(line2, sizeof(line2), "%-16s", ip.c_str());
+    lcd.setCursor(0, 0); lcd.print("  IP Address:   ");
+    lcd.setCursor(0, 1); lcd.print(line2);
+}
+
+// Call every loop(); toggles between temp and IP screen every DISPLAY_TOGGLE_MS
+static void tickDisplay() {
+    if (!lcdPresent) return;
+    unsigned long now = millis();
+    if (now - lastDisplayToggle < DISPLAY_TOGGLE_MS) return;
+    lastDisplayToggle = now;
+    showingIp = !showingIp;
+    if (showingIp) showIpScreen();
+    else           updateDisplay();
+}
+
+// ── Web UI ────────────────────────────────────────────────────────────────────
+
+static const char PAGE_CSS[] =
+    "body{font-family:sans-serif;max-width:520px;margin:30px auto;padding:0 16px;color:#333}"
+    "nav{display:flex;gap:12px;margin-bottom:24px}"
+    "nav a{text-decoration:none;color:#0066cc;padding:6px 14px;border-radius:4px}"
+    "nav a.on{background:#0066cc;color:#fff}"
+    "h1{margin:0 0 20px;font-size:1.4em}"
+    "table{width:100%;border-collapse:collapse}"
+    "th,td{padding:10px 12px;border:1px solid #ddd;text-align:left}"
+    "th{background:#f8f8f8;font-weight:600}"
+    ".ok{color:#2a9d2a}.na{color:#aaa}.err{color:#c00}"
+    "label{display:block;margin-bottom:14px}"
+    "label span{display:block;font-size:.85em;font-weight:600;color:#555;margin-bottom:4px}"
+    "input{width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;"
+           "border-radius:4px;font-size:1em}"
+    "button{margin-top:8px;padding:10px 24px;background:#0066cc;color:#fff;"
+            "border:none;border-radius:4px;font-size:1em;cursor:pointer}"
+    "button:hover{background:#004fa3}"
+    ".foot{font-size:.8em;color:#999;margin-top:20px}";
+
+static String pageHead(const char* title, bool autoRefresh = false) {
+    String h = "<!DOCTYPE html><html><head>"
+               "<meta charset='utf-8'>"
+               "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+               "<title>"; h += title; h += "</title>";
+    if (autoRefresh) h += "<meta http-equiv='refresh' content='30'>";
+    h += "<style>"; h += PAGE_CSS; h += "</style></head><body>";
+    return h;
+}
+
+static String navBar(bool onStatus) {
+    if (onStatus)
+        return "<nav><a href='/' class='on'>Status</a><a href='/settings'>Settings</a></nav>";
+    return "<nav><a href='/'>Status</a><a href='/settings' class='on'>Settings</a></nav>";
+}
+
+static void handleStatus() {
+    String html = pageHead("Tank Monitor", /*autoRefresh=*/true);
+    html += navBar(true);
+    html += "<h1>Tank Monitor</h1>"
+            "<table><tr><th>Sensor</th><th>&deg;C</th><th>&deg;F</th></tr>";
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        html += "<tr><td>"; html += SENSORS[i].label; html += "</td>";
+        if (temps[i] == DEVICE_DISCONNECTED_C) {
+            html += "<td class='na'>--</td><td class='na'>--</td>";
+        } else {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "<td class='ok'>%.1f</td><td>%.1f</td>",
+                     temps[i], temps[i] * 9.0f / 5.0f + 32.0f);
+            html += buf;
+        }
+        html += "</tr>";
+    }
+    html += "</table><p class='foot'>";
+    if (mqtt.connected()) {
+        html += "<span class='ok'>&#10003; MQTT connected</span>";
+    } else {
+        html += "<span class='err'>&#10007; MQTT disconnected &mdash; "
+                "<a href='/settings'>check settings</a></span>";
+    }
+    html += " &middot; broker: "; html += g_mqttHost;
+    html += ":"; html += g_mqttPort;
+    html += " &middot; auto-refreshes every 30&nbsp;s</p>"
+            "</body></html>";
+    webServer.send(200, "text/html", html);
+}
+
+static void handleSettings() {
+    char portBuf[8];
+    itoa(g_mqttPort, portBuf, 10);
+
+    String html = pageHead("Tank Monitor - Settings");
+    html += navBar(false);
+    html += "<h1>Settings</h1>"
+            "<form method='POST' action='/save'>";
+
+    html += "<label><span>MQTT Host</span>"
+            "<input name='host' value='"; html += g_mqttHost; html += "' required></label>";
+
+    html += "<label><span>MQTT Port</span>"
+            "<input name='port' type='number' value='"; html += portBuf;
+    html += "' min='1' max='65535' required></label>";
+
+    html += "<label><span>MQTT Username</span>"
+            "<input name='user' autocomplete='off' value='"; html += g_mqttUser; html += "'></label>";
+
+    html += "<label><span>MQTT Password</span>"
+            "<input name='pass' type='password' autocomplete='new-password' value='";
+    html += g_mqttPass; html += "'></label>";
+
+    html += "<button type='submit'>Save &amp; Restart</button></form>"
+            "<p class='foot'>The device will restart after saving. Reconnect in a few seconds.</p>"
+            "</body></html>";
+    webServer.send(200, "text/html", html);
+}
+
+static void handleSave() {
+    String host = webServer.arg("host");
+    int    port = webServer.arg("port").toInt();
+    String user = webServer.arg("user");
+    String pass = webServer.arg("pass");
+
+    if (host.isEmpty() || port < 1 || port > 65535) {
+        webServer.send(400, "text/plain", "Bad request: host and valid port are required");
+        return;
+    }
+
+    persistSettings(host, port, user, pass);
+
+    String html = pageHead("Tank Monitor - Saved");
+    html += "<h1>Settings saved</h1>"
+            "<p>The device is restarting&hellip;</p>"
+            "<p class='foot'>Reload this page in a few seconds.</p>"
+            "</body></html>";
+    webServer.send(200, "text/html", html);
+    delay(1000);
+    ESP.restart();
+}
+
+static void setupWebServer() {
+    webServer.on("/",         HTTP_GET,  handleStatus);
+    webServer.on("/settings", HTTP_GET,  handleSettings);
+    webServer.on("/save",     HTTP_POST, handleSave);
+    webServer.begin();
+}
+
+#endif // ENABLE_WIFI
+
+// ── Setup / Loop ──────────────────────────────────────────────────────────────
+
+unsigned long lastReadAt = 0;
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    lcdPresent = lcdProbe();
+    if (lcdPresent) {
+        lcd.init();
+        lcd.backlight();
+        lcd.print("Tank Monitor");
+        lcd.setCursor(0, 1);
+        lcd.print("Starting up...");
+        Serial.println("LCD display: found");
+    } else {
+        Serial.println("LCD display: not found, running without display");
+    }
+
+    OneWire* buses[] = { &ow0, &ow1, &ow2, &ow3 };
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        temps[i] = DEVICE_DISCONNECTED_C;
+        ds[i].setOneWire(buses[i]);
+        ds[i].begin();
+        Serial.printf("GPIO %2d (%s): %d sensor(s)\n",
+                      SENSORS[i].pin, SENSORS[i].label, ds[i].getDeviceCount());
+    }
+    // Discard the DS18B20 power-on reset value (always 85°C) before the main loop reads
+    for (int i = 0; i < NUM_SENSORS; i++) ds[i].requestTemperatures();
+    delay(1000);
+
+#if ENABLE_WIFI
+    connectWifi();
+    loadSettings();
+    mqtt.setServer(g_mqttHost, g_mqttPort);
+    mqtt.setBufferSize(1024);
+    tryConnectMqtt();
+    setupOTA();
+    setupWebServer();
+    Serial.printf("Web interface: http://%s/\n", WiFi.localIP().toString().c_str());
+    Serial.printf("OTA upload:    pio run -t upload --upload-port=%s\n",
+                  WiFi.localIP().toString().c_str());
+    lastDisplayToggle = millis();  // start 5-s rotation clock after setup completes
+#endif
+
+    updateDisplay();
+}
+
+void loop() {
+#if ENABLE_WIFI
+    tryConnectMqtt();
+    mqtt.loop();
+    ArduinoOTA.handle();
+    webServer.handleClient();
+    tickDisplay();
+#endif
+
+    unsigned long now = millis();
+    if (lastReadAt == 0 || now - lastReadAt >= READ_INTERVAL_MS) {
+        for (int i = 0; i < NUM_SENSORS; i++) {
+            ds[i].requestTemperatures();
+            temps[i] = ds[i].getTempCByIndex(0);
+
+            if (temps[i] == DEVICE_DISCONNECTED_C) {
+                Serial.printf("%-16s: not connected\n", SENSORS[i].label);
+#if ENABLE_WIFI
+                if (mqtt.connected()) mqtt.publish(SENSORS[i].stateTopic, "unavailable");
+#endif
+            } else {
+                Serial.printf("%-16s: %.1f°C  (%.1f°F)\n",
+                              SENSORS[i].label, temps[i], temps[i] * 9.0f / 5.0f + 32.0f);
+#if ENABLE_WIFI
+                if (mqtt.connected()) {
+                    char payload[16];
+                    snprintf(payload, sizeof(payload), "%.1f", temps[i]);
+                    mqtt.publish(SENSORS[i].stateTopic, payload);
+                }
+#endif
+            }
+        }
+        lastReadAt = millis();
+        // Only redraw temps if the LCD is currently showing the temp screen
+#if ENABLE_WIFI
+        if (!showingIp) updateDisplay();
+#else
+        updateDisplay();
+#endif
+    }
+}

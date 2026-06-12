@@ -1,0 +1,6 @@
+.pio/
+include/config.h
+.mcp.json
+test.txt
+.claude/
+.vscode/

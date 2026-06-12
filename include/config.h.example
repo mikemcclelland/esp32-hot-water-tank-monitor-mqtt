@@ -1,0 +1,22 @@
+#pragma once
+
+// Wiring — each probe screws into a pluggable terminal adapter (Yellow→DAT, Red→VCC, Black→GND)
+// then connects to its column on the board: S pin → GPIO below, V pin → 3.3V, G pin → GND
+#define PIN_RHS_TOP    14  // Io14 (DIGITAL section)
+#define PIN_RHS_BOTTOM 33  // Io33 (ANALOG section)
+#define PIN_LHS_TOP    32  // Io32 (ANALOG section)
+#define PIN_LHS_BOTTOM 5   // Io5  (DIGITAL section)
+
+#define READ_INTERVAL_MS    30000UL  // temperature polling interval (ms)
+
+// ── Step 2: WiFi + MQTT ──────────────────────────────────────────────────────
+// Set ENABLE_WIFI false to test sensors over serial with no network needed.
+#define ENABLE_WIFI false
+
+#define WIFI_SSID     "your-wifi-name"
+#define WIFI_PASSWORD "your-wifi-password"
+
+#define MQTT_HOST "192.168.1.x"   // Home Assistant IP
+#define MQTT_PORT 1883
+#define MQTT_USER "mqtt_devices"
+#define MQTT_PASS "your-mqtt-password"
